@@ -13,6 +13,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import plotly.graph_objects as go
+import plotly.express as px
 
 # ------------------------------------------------------------
 # 기본 설정
@@ -25,8 +26,8 @@ GEO_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/bounda
 # 5단계 구간 경계값 (전국 시군구를 다섯 덩어리로 나눈 실제 값)
 BIN_EDGES = [-np.inf, 19, 23, 28, 38, np.inf]
 BIN_LABELS = ["19% 미만", "19~23%", "23~28%", "28~38%", "38% 이상"]
-# 옅은 색 -> 진한 색 순서 (ColorBrewer Reds 5단계)
-BIN_COLORS = ["#fee5d9", "#fcae91", "#fb6a4a", "#de2d26", "#a50f15"]
+# 옅은 색 -> 진한 색 순서 (ColorBrewer Blues 5단계)
+BIN_COLORS = ["#eff3ff", "#bdd7e7", "#6baed6", "#3182bd", "#08519c"]
 
 
 # ------------------------------------------------------------
@@ -58,13 +59,16 @@ def load_geojson(url: str) -> dict:
     return geo
 
 
-def get_age_columns(df: pd.DataFrame):
-    """'계_0세' ~ '계_100세 이상' 형식의 나이별(남녀 합계) 열 이름과 나이를 뽑아낸다."""
+def get_age_columns(df: pd.DataFrame, prefix: str = "계_"):
+    """'계_0세'~'계_100세 이상' 같은 나이별 열 이름과 나이를 뽑아낸다.
+
+    prefix를 '남_' 또는 '여_'로 바꾸면 성별 인구 열도 같은 방식으로 뽑을 수 있다.
+    """
     age_cols = []
     for col in df.columns:
-        if not col.startswith("계_"):
+        if not col.startswith(prefix):
             continue
-        m = re.match(r"^계_(\d+)세(\s*이상)?$", col)
+        m = re.match(rf"^{re.escape(prefix)}(\d+)세(\s*이상)?$", col)
         if m:
             age = int(m.group(1))
             age_cols.append((col, age))
@@ -111,6 +115,78 @@ def build_sigungu_ratio(pop_df: pd.DataFrame) -> pd.DataFrame:
     ).astype(int)
 
     return grouped, latest_year
+
+
+@st.cache_data(show_spinner="연도별 고령화율을 계산하는 중...")
+def build_all_years_ratio(pop_df: pd.DataFrame) -> pd.DataFrame:
+    """모든 연도에 대해 시군구별 고령화율을 계산한다 (애니메이션 지도용)."""
+
+    df = pop_df.copy()
+    df["시군구코드"] = df["코드"].str[:5]
+
+    age_cols = get_age_columns(df, "계_")
+    all_age_col_names = [c for c, _ in age_cols]
+    old_col_names = [c for c, age in age_cols if age >= 65]
+
+    df["전체인구"] = df[all_age_col_names].sum(axis=1)
+    df["고령인구"] = df[old_col_names].sum(axis=1)
+
+    grouped = (
+        df.groupby(["연도", "시군구코드"], as_index=False)
+        .agg(
+            전체인구=("전체인구", "sum"),
+            고령인구=("고령인구", "sum"),
+            시도=("시도", "first"),
+            시군구=("시군구", "first"),
+        )
+    )
+
+    grouped["고령화율"] = (grouped["고령인구"] / grouped["전체인구"] * 100).round(2)
+    grouped["구간"] = pd.cut(
+        grouped["고령화율"], bins=BIN_EDGES, labels=range(len(BIN_LABELS))
+    ).astype(int)
+    grouped["구간라벨"] = grouped["구간"].map(lambda i: BIN_LABELS[i])
+
+    return grouped
+
+
+@st.cache_data(show_spinner="인구 피라미드를 만드는 중...")
+def build_pyramid(pop_df: pd.DataFrame, year: int, sigungu_code: str) -> pd.DataFrame:
+    """선택한 연도·시군구의 5세 단위 남녀 인구 피라미드 데이터를 만든다."""
+
+    df = pop_df[pop_df["연도"] == year].copy()
+    df["시군구코드"] = df["코드"].str[:5]
+    df = df[df["시군구코드"] == sigungu_code]
+
+    male_cols = get_age_columns(df, "남_")
+    female_cols = get_age_columns(df, "여_")
+
+    def age_bin(age: int) -> str:
+        """나이를 5세 단위 구간 이름으로 바꾼다 (예: 23 -> '20~24세')."""
+        if age >= 100:
+            return "100세 이상"
+        start = (age // 5) * 5
+        return f"{start}~{start + 4}세"
+
+    # 나이 구간 순서 (0~4세부터 100세 이상까지, 어린 나이가 먼저 오도록)
+    bin_order = [f"{i}~{i + 4}세" for i in range(0, 100, 5)] + ["100세 이상"]
+
+    male_sum = {b: 0 for b in bin_order}
+    for col, age in male_cols:
+        male_sum[age_bin(age)] += df[col].sum()
+
+    female_sum = {b: 0 for b in bin_order}
+    for col, age in female_cols:
+        female_sum[age_bin(age)] += df[col].sum()
+
+    pyramid_df = pd.DataFrame(
+        {
+            "연령대": bin_order,
+            "남": [male_sum[b] for b in bin_order],
+            "여": [female_sum[b] for b in bin_order],
+        }
+    )
+    return pyramid_df
 
 
 # ------------------------------------------------------------
@@ -183,9 +259,109 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ------------------------------------------------------------
+# 고령화율 순위 막대그래프
+# ------------------------------------------------------------
+st.subheader("고령화율 순위 그래프")
+
+# 전국 평균(인구가중 평균) 고령화율 계산
+national_avg = ratio_df["고령인구"].sum() / ratio_df["전체인구"].sum() * 100
+
+rank_option = st.radio(
+    "표시할 범위를 골라주세요",
+    ["상위 15개", "하위 15개", "상위 15 + 하위 15"],
+    horizontal=True,
+)
+
+if rank_option == "상위 15개":
+    rank_df = ratio_df.sort_values("고령화율", ascending=False).head(15)
+elif rank_option == "하위 15개":
+    rank_df = ratio_df.sort_values("고령화율", ascending=True).head(15)
+else:
+    top15 = ratio_df.sort_values("고령화율", ascending=False).head(15)
+    low15 = ratio_df.sort_values("고령화율", ascending=True).head(15)
+    rank_df = pd.concat([top15, low15]).drop_duplicates(subset="시군구코드")
+
+# 값이 작은 것이 아래에, 큰 것이 위에 오도록 정렬 (가로 막대그래프 특성상 역순 정렬)
+rank_df = rank_df.sort_values("고령화율", ascending=True)
+rank_df["지역명"] = rank_df["시도"] + " " + rank_df["시군구"]
+
+# 지도와 같은 5단계 색을 막대그래프에도 그대로 사용해서 통일감을 줌
+bar_colors = rank_df["구간"].map(lambda i: BIN_COLORS[i])
+
+bar_fig = go.Figure(
+    go.Bar(
+        x=rank_df["고령화율"],
+        y=rank_df["지역명"],
+        orientation="h",
+        marker_color=bar_colors,
+        text=rank_df["고령화율"].astype(str) + "%",
+        textposition="outside",
+    )
+)
+
+# 전국 평균선을 점선으로 표시
+bar_fig.add_vline(
+    x=national_avg,
+    line_dash="dash",
+    line_color="gray",
+    annotation_text=f"전국 평균 {national_avg:.1f}%",
+    annotation_position="top",
+)
+
+bar_fig.update_layout(
+    xaxis_title="고령화율(%)",
+    yaxis_title="",
+    height=max(400, 24 * len(rank_df)),
+    margin=dict(l=0, r=40, t=40, b=0),
+)
+
+st.plotly_chart(bar_fig, use_container_width=True)
+
+# ------------------------------------------------------------
+# 연도별 고령화 변화 애니메이션 지도
+# ------------------------------------------------------------
+st.subheader("연도별 고령화 변화 지도")
+st.caption("하단의 ▶ 버튼을 누르거나 슬라이더를 움직이면 연도별 변화를 볼 수 있어요.")
+
+all_years_df = build_all_years_ratio(pop_df)
+all_years_df = all_years_df.sort_values("연도")
+
+anim_fig = px.choropleth(
+    all_years_df,
+    geojson=geojson_data,
+    locations="시군구코드",
+    featureidkey="properties.코드",
+    color="구간라벨",
+    color_discrete_map=dict(zip(BIN_LABELS, BIN_COLORS)),
+    category_orders={"구간라벨": BIN_LABELS},
+    animation_frame="연도",
+    hover_name="시군구",
+    hover_data={"시도": True, "고령화율": True, "시군구코드": False, "구간라벨": False},
+)
+
+# 배경 지도 타일 없이 경계선만 보이도록 설정 (메인 지도와 동일)
+anim_fig.update_geos(
+    fitbounds="locations",
+    visible=False,
+    showcountries=False,
+    showcoastlines=False,
+    showland=False,
+    showframe=False,
+    bgcolor="rgba(0,0,0,0)",
+)
+
+anim_fig.update_layout(
+    margin=dict(l=0, r=0, t=10, b=0),
+    height=700,
+    legend_title_text="고령화율 구간",
+)
+
+st.plotly_chart(anim_fig, use_container_width=True)
+
+# ------------------------------------------------------------
 # 고령화율 상위 10곳 / 하위 10곳 표
 # ------------------------------------------------------------
-st.subheader("고령화율 순위")
+st.subheader("고령화율 순위 표")
 
 top10 = ratio_df.sort_values("고령화율", ascending=False).head(10)
 bottom10 = ratio_df.sort_values("고령화율", ascending=True).head(10)
@@ -205,3 +381,62 @@ with col2:
         bottom10[["시도", "시군구", "고령화율"]].reset_index(drop=True),
         use_container_width=True,
     )
+
+# ------------------------------------------------------------
+# 지역별 인구 피라미드
+# ------------------------------------------------------------
+st.subheader("지역별 인구 피라미드")
+
+# 선택창에 보여줄 '시도 시군구' 이름 목록 만들기
+region_df = ratio_df.copy()
+region_df["지역표시"] = region_df["시도"] + " " + region_df["시군구"]
+region_df = region_df.sort_values("지역표시")
+
+selected_label = st.selectbox("지역을 선택하세요", region_df["지역표시"].tolist())
+selected_code = region_df.loc[
+    region_df["지역표시"] == selected_label, "시군구코드"
+].values[0]
+
+pyramid_df = build_pyramid(pop_df, latest_year, selected_code)
+
+pyramid_fig = go.Figure()
+
+# 남자는 왼쪽으로 보이도록 값을 음수로 바꿔서 그림
+pyramid_fig.add_trace(
+    go.Bar(
+        y=pyramid_df["연령대"],
+        x=-pyramid_df["남"],
+        name="남",
+        orientation="h",
+        marker_color="#3182bd",
+    )
+)
+pyramid_fig.add_trace(
+    go.Bar(
+        y=pyramid_df["연령대"],
+        x=pyramid_df["여"],
+        name="여",
+        orientation="h",
+        marker_color="#de2d26",
+    )
+)
+
+# x축 눈금이 음수로 보이지 않고 절댓값(실제 인구 수)으로 보이도록 설정
+max_val = max(1, int(max(pyramid_df["남"].max(), pyramid_df["여"].max())))
+tick_step = max(1, max_val // 4)
+tick_vals = list(range(-tick_step * 4, tick_step * 4 + 1, tick_step))
+tick_text = [str(abs(v)) for v in tick_vals]
+
+pyramid_fig.update_layout(
+    title=f"{selected_label} 인구 피라미드 ({latest_year}년)",
+    barmode="overlay",
+    bargap=0.1,
+    xaxis_title="인구 수(명)",
+    yaxis_title="연령대",
+    yaxis=dict(categoryorder="array", categoryarray=pyramid_df["연령대"].tolist()),
+    xaxis=dict(tickvals=tick_vals, ticktext=tick_text),
+    height=800,
+    margin=dict(l=0, r=0, t=40, b=0),
+)
+
+st.plotly_chart(pyramid_fig, use_container_width=True)
