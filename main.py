@@ -63,7 +63,13 @@ def load_population(url: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner="지도 경계 데이터를 불러오는 중...")
 def load_geojson(url: str) -> dict:
-    """전국 시군구 경계 GeoJSON을 읽어온다."""
+    """전국 시군구 경계 GeoJSON을 읽어온다.
+
+    원본 좌표가 소수점 14자리까지 있는데, 시군구 단위 전국 지도를 그리는 데는
+    그렇게 정밀할 필요가 없다(소수 4자리만 해도 약 11m 오차 수준). 좌표를
+    반올림해서 데이터 용량을 절반 가까이 줄이면, 지도를 그릴 때마다 브라우저로
+    전송되는 데이터가 줄어들어 메모리·속도 부담이 줄어든다.
+    """
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
@@ -73,10 +79,20 @@ def load_geojson(url: str) -> dict:
 
     geo = resp.json()
 
-    # geojson의 '코드' 속성도 문자열인지 확인(자리수 통일)
+    def round_coords(coords, ndigits=4):
+        """좌표 배열을 재귀적으로 돌면서 소수점 자리수를 줄인다."""
+        if isinstance(coords[0], (int, float)):
+            return [round(c, ndigits) for c in coords]
+        return [round_coords(c, ndigits) for c in coords]
+
     for feature in geo["features"]:
         props = feature["properties"]
+        # geojson의 '코드' 속성도 문자열인지 확인(자리수 통일)
         props["코드"] = str(props["코드"])
+        feature["geometry"]["coordinates"] = round_coords(
+            feature["geometry"]["coordinates"]
+        )
+
     return geo
 
 
@@ -279,12 +295,6 @@ with st.expander("📚 용어 설명: 고령화사회 · 고령사회 · 초고�
 # ------------------------------------------------------------
 # 지도 그리기 (단계구분도, 5단계 색, 배경 타일 없음)
 # ------------------------------------------------------------
-# 마우스 오버 시 보여줄 텍스트
-ratio_df["hover_text"] = (
-    ratio_df["시도"] + " " + ratio_df["시군구"]
-    + "<br>고령화율: " + ratio_df["고령화율"].astype(str) + "%"
-)
-
 # 구간(0~4)을 색 5개로 나눈 이산(discrete) 컬러스케일 만들기
 n_bins = len(BIN_LABELS)
 colorscale = []
@@ -292,48 +302,64 @@ for i, color in enumerate(BIN_COLORS):
     colorscale.append([i / n_bins, color])
     colorscale.append([(i + 1) / n_bins, color])
 
-# z값은 구간의 가운데 값(0.5, 1.5, ...)으로 넣어서 경계선에서 색이 헷갈리지 않게 함
-z_values = ratio_df["구간"] + 0.5
 
-fig = go.Figure(
-    go.Choropleth(
-        geojson=geojson_data,
-        locations=ratio_df["시군구코드"],
-        z=z_values,
-        featureidkey="properties.코드",
-        text=ratio_df["hover_text"],
-        hoverinfo="text",
-        colorscale=colorscale,
-        zmin=0,
-        zmax=n_bins,
-        marker_line_color="white",
-        marker_line_width=0.5,
-        colorbar=dict(
-            title="고령화율",
-            tickmode="array",
-            tickvals=[i + 0.5 for i in range(n_bins)],
-            ticktext=BIN_LABELS,
-        ),
+@st.cache_data(show_spinner="지도를 그리는 중...")
+def build_choropleth_figure(_geojson_data: dict, df: pd.DataFrame) -> go.Figure:
+    """시군구 단계구분도(Choropleth)를 만든다.
+
+    geojson(경계 데이터)이 커서(약 1MB) 매번 새로 Figure를 만들면 그때마다
+    브라우저로 다시 전송해야 해서 느려지고 서버 메모리 부담도 커진다.
+    같은 데이터로는 한 번만 만들고 재사용하도록 캐시를 건다.
+    """
+    hover_text = (
+        df["시도"] + " " + df["시군구"]
+        + "<br>고령화율: " + df["고령화율"].astype(str) + "%"
     )
-)
+    z_values = df["구간"] + 0.5
 
-# 배경 지도 타일 없이 경계선만 보이도록 설정
-fig.update_geos(
-    fitbounds="locations",
-    visible=False,
-    showcountries=False,
-    showcoastlines=False,
-    showland=False,
-    showframe=False,
-    bgcolor="rgba(0,0,0,0)",
-)
+    fig = go.Figure(
+        go.Choropleth(
+            geojson=_geojson_data,
+            locations=df["시군구코드"],
+            z=z_values,
+            featureidkey="properties.코드",
+            text=hover_text,
+            hoverinfo="text",
+            colorscale=colorscale,
+            zmin=0,
+            zmax=n_bins,
+            marker_line_color="white",
+            marker_line_width=0.5,
+            colorbar=dict(
+                title="고령화율",
+                tickmode="array",
+                tickvals=[i + 0.5 for i in range(n_bins)],
+                ticktext=BIN_LABELS,
+            ),
+        )
+    )
 
-fig.update_layout(
-    margin=dict(l=0, r=0, t=10, b=0),
-    height=700,
-)
+    # 배경 지도 타일 없이 경계선만 보이도록 설정
+    fig.update_geos(
+        fitbounds="locations",
+        visible=False,
+        showcountries=False,
+        showcoastlines=False,
+        showland=False,
+        showframe=False,
+        bgcolor="rgba(0,0,0,0)",
+    )
 
-st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=700,
+    )
+
+    return fig
+
+
+fig = build_choropleth_figure(geojson_data, ratio_df)
+st.plotly_chart(fig, width='stretch')
 
 # ------------------------------------------------------------
 # 고령화율 순위 막대그래프
@@ -403,7 +429,7 @@ bar_fig.update_layout(
     margin=dict(l=0, r=40, t=40, b=0),
 )
 
-st.plotly_chart(bar_fig, use_container_width=True)
+st.plotly_chart(bar_fig, width='stretch')
 
 # ------------------------------------------------------------
 # 연도별 고령화 변화 지도 (슬라이더로 한 해씩 보기)
@@ -421,52 +447,11 @@ selected_year = st.select_slider(
 # 선택한 연도의 데이터만 뽑아서 지도 1장만 그린다
 # (애니메이션으로 모든 연도를 한 번에 담으면 데이터 용량이 커져서
 #  Streamlit Cloud에서 느려지거나 멈추는 문제가 있었기 때문에,
-#  슬라이더로 한 해씩만 가볍게 그리는 방식으로 바꿈)
+#  슬라이더로 한 해씩만 가볍게 그리고, 같은 연도를 다시 보면 캐시를 재사용하게 함)
 year_df = all_years_df[all_years_df["연도"] == selected_year].copy()
-year_df["hover_text"] = (
-    year_df["시도"] + " " + year_df["시군구"]
-    + "<br>고령화율: " + year_df["고령화율"].astype(str) + "%"
-)
-year_z_values = year_df["구간"] + 0.5
 
-year_fig = go.Figure(
-    go.Choropleth(
-        geojson=geojson_data,
-        locations=year_df["시군구코드"],
-        z=year_z_values,
-        featureidkey="properties.코드",
-        text=year_df["hover_text"],
-        hoverinfo="text",
-        colorscale=colorscale,
-        zmin=0,
-        zmax=n_bins,
-        marker_line_color="white",
-        marker_line_width=0.5,
-        colorbar=dict(
-            title="고령화율",
-            tickmode="array",
-            tickvals=[i + 0.5 for i in range(n_bins)],
-            ticktext=BIN_LABELS,
-        ),
-    )
-)
-
-year_fig.update_geos(
-    fitbounds="locations",
-    visible=False,
-    showcountries=False,
-    showcoastlines=False,
-    showland=False,
-    showframe=False,
-    bgcolor="rgba(0,0,0,0)",
-)
-
-year_fig.update_layout(
-    margin=dict(l=0, r=0, t=10, b=0),
-    height=700,
-)
-
-st.plotly_chart(year_fig, use_container_width=True)
+year_fig = build_choropleth_figure(geojson_data, year_df)
+st.plotly_chart(year_fig, width='stretch')
 
 # ------------------------------------------------------------
 # 고령화율 상위 10곳 / 하위 10곳 표
@@ -616,4 +601,4 @@ pyramid_fig.update_layout(
     margin=dict(l=0, r=0, t=40, b=0),
 )
 
-st.plotly_chart(pyramid_fig, use_container_width=True)
+st.plotly_chart(pyramid_fig, width='stretch')
