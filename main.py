@@ -7,6 +7,7 @@
 
 import re
 import json
+import io
 
 import numpy as np
 import pandas as pd
@@ -44,8 +45,17 @@ def load_population(url: str) -> pd.DataFrame:
     """읍·면·동 단위 인구 데이터를 읽어온다.
 
     '코드' 열은 계산용 숫자가 아니라 이름표이므로 반드시 문자열(str)로 읽는다.
+    네트워크가 느리거나 실패할 때 앱이 원인 모르게 멈추지 않도록,
+    타임아웃을 두고 실패하면 화면에 에러 메시지를 보여준다.
     """
-    df = pd.read_csv(url, compression="gzip", dtype={"코드": str})
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        st.error(f"인구 데이터를 받아오지 못했어요. 잠시 후 다시 시도해 주세요. ({e})")
+        st.stop()
+
+    df = pd.read_csv(io.BytesIO(resp.content), compression="gzip", dtype={"코드": str})
     # 혹시 코드 앞의 0이 사라졌을 경우를 대비해 문자열 처리를 한 번 더 확실히 함
     df["코드"] = df["코드"].astype(str)
     return df
@@ -54,8 +64,13 @@ def load_population(url: str) -> pd.DataFrame:
 @st.cache_data(show_spinner="지도 경계 데이터를 불러오는 중...")
 def load_geojson(url: str) -> dict:
     """전국 시군구 경계 GeoJSON을 읽어온다."""
-    resp = requests.get(url)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        st.error(f"지도 경계 데이터를 받아오지 못했어요. 잠시 후 다시 시도해 주세요. ({e})")
+        st.stop()
+
     geo = resp.json()
 
     # geojson의 '코드' 속성도 문자열인지 확인(자리수 통일)
