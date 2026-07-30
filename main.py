@@ -29,6 +29,13 @@ BIN_LABELS = ["19% 미만", "19~23%", "23~28%", "28~38%", "38% 이상"]
 # 옅은 색 -> 진한 색 순서 (ColorBrewer Blues 5단계)
 BIN_COLORS = ["#eff3ff", "#bdd7e7", "#6baed6", "#3182bd", "#08519c"]
 
+# 고령화 단계 기준선 (국제/통계청 통용 기준): 65세 이상 인구 비율 기준
+AGING_STAGES = [
+    (7, "고령화사회"),
+    (14, "고령사회"),
+    (20, "초고령사회"),
+]
+
 
 # ------------------------------------------------------------
 # 데이터 불러오기 (캐시를 사용해서 매번 다시 받지 않도록 함)
@@ -59,6 +66,27 @@ def load_geojson(url: str) -> dict:
     return geo
 
 
+@st.cache_data(show_spinner="지도 기준 지역 이름을 정리하는 중...")
+def build_geo_names(_geojson_data: dict) -> pd.DataFrame:
+    """geojson에 있는 코드별 정확한 시도·시군구 이름을 가져온다.
+
+    인구 데이터의 '시군구' 열은 수원시·화성시·창원시 같은 대도시의 경우
+    일반구(예: 효행구, 동탄구) 구분 없이 그냥 '화성시'로만 되어 있어서,
+    코드는 다른데 이름이 똑같은 지역이 여럿 생긴다. 반면 geojson은 각 코드마다
+    '화성시효행구'처럼 구까지 정확히 구분된 이름을 갖고 있으므로, 화면에 보여줄
+    이름은 population 데이터가 아니라 geojson 쪽 이름을 기준으로 삼는다.
+    """
+    records = [
+        {
+            "시군구코드": f["properties"]["코드"],
+            "시도": f["properties"]["시도"],
+            "시군구": f["properties"]["시군구"],
+        }
+        for f in _geojson_data["features"]
+    ]
+    return pd.DataFrame(records)
+
+
 def get_age_columns(df: pd.DataFrame, prefix: str = "계_"):
     """'계_0세'~'계_100세 이상' 같은 나이별 열 이름과 나이를 뽑아낸다.
 
@@ -76,7 +104,7 @@ def get_age_columns(df: pd.DataFrame, prefix: str = "계_"):
 
 
 @st.cache_data(show_spinner="고령화율을 계산하는 중...")
-def build_sigungu_ratio(pop_df: pd.DataFrame) -> pd.DataFrame:
+def build_sigungu_ratio(pop_df: pd.DataFrame, geo_names: pd.DataFrame) -> pd.DataFrame:
     """읍면동 인구 데이터를 시군구 단위로 묶어서 65세 이상 인구 비율을 계산한다."""
 
     # 1) 가장 최신 연도만 사용
@@ -90,24 +118,39 @@ def build_sigungu_ratio(pop_df: pd.DataFrame) -> pd.DataFrame:
     age_cols = get_age_columns(df)
     all_age_col_names = [c for c, _ in age_cols]
     old_col_names = [c for c, age in age_cols if age >= 65]
+    working_col_names = [c for c, age in age_cols if 15 <= age <= 64]
 
-    # 4) 전체 인구, 65세 이상 인구를 각 읍면동 행에 대해 계산
+    # 4) 전체 인구, 65세 이상 인구, 생산연령인구(15~64세)를 각 읍면동 행에 대해 계산
     df["전체인구"] = df[all_age_col_names].sum(axis=1)
     df["고령인구"] = df[old_col_names].sum(axis=1)
+    df["생산연령인구"] = df[working_col_names].sum(axis=1)
 
-    # 5) 시군구 단위로 합산
+    # 5) 시군구 단위로 인구만 합산 (이름은 population 데이터가 아니라 geo_names 사용)
     grouped = (
         df.groupby("시군구코드", as_index=False)
         .agg(
             전체인구=("전체인구", "sum"),
             고령인구=("고령인구", "sum"),
-            시도=("시도", "first"),
-            시군구=("시군구", "first"),
+            생산연령인구=("생산연령인구", "sum"),
         )
     )
 
+    # 5-1) 수원시·화성시·창원시처럼 일반구가 있는 대도시는 population 데이터의
+    #      '시군구' 열에 구 이름이 빠져 있어서(예: '화성시'만 4번 반복) 지도(geojson)
+    #      쪽의 정확한 이름('화성시효행구' 등)으로 덮어쓴다.
+    grouped = grouped.merge(geo_names, on="시군구코드", how="left")
+
     # 6) 고령화율(%) 계산
     grouped["고령화율"] = (grouped["고령인구"] / grouped["전체인구"] * 100).round(2)
+
+    # 6-1) 노년부양비(%) = 고령인구 / 생산연령인구(15~64세) * 100
+    #      생산연령인구 100명이 고령자를 몇 명 부양하는지 나타내는 지표
+    grouped["노년부양비"] = (
+        grouped["고령인구"] / grouped["생산연령인구"] * 100
+    ).round(1)
+
+    # 6-2) 부양인원 = 생산연령인구 / 고령인구 -> "생산인구 몇 명당 고령자 1명"
+    grouped["부양인원"] = (grouped["생산연령인구"] / grouped["고령인구"]).round(1)
 
     # 7) 5단계 구간으로 나누기
     grouped["구간"] = pd.cut(
@@ -118,7 +161,7 @@ def build_sigungu_ratio(pop_df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="연도별 고령화율을 계산하는 중...")
-def build_all_years_ratio(pop_df: pd.DataFrame) -> pd.DataFrame:
+def build_all_years_ratio(pop_df: pd.DataFrame, geo_names: pd.DataFrame) -> pd.DataFrame:
     """모든 연도에 대해 시군구별 고령화율을 계산한다 (애니메이션 지도용)."""
 
     df = pop_df.copy()
@@ -136,10 +179,11 @@ def build_all_years_ratio(pop_df: pd.DataFrame) -> pd.DataFrame:
         .agg(
             전체인구=("전체인구", "sum"),
             고령인구=("고령인구", "sum"),
-            시도=("시도", "first"),
-            시군구=("시군구", "first"),
         )
     )
+
+    # population 데이터의 '시군구' 열 대신 geojson 쪽 정확한 이름을 붙인다
+    grouped = grouped.merge(geo_names, on="시군구코드", how="left")
 
     grouped["고령화율"] = (grouped["고령인구"] / grouped["전체인구"] * 100).round(2)
     grouped["구간"] = pd.cut(
@@ -194,10 +238,29 @@ def build_pyramid(pop_df: pd.DataFrame, year: int, sigungu_code: str) -> pd.Data
 # ------------------------------------------------------------
 pop_df = load_population(POP_URL)
 geojson_data = load_geojson(GEO_URL)
-ratio_df, latest_year = build_sigungu_ratio(pop_df)
+geo_names = build_geo_names(geojson_data)
+ratio_df, latest_year = build_sigungu_ratio(pop_df, geo_names)
 
 st.title("🗺️ 전국 시군구별 고령화 지도")
 st.caption(f"기준 연도: {latest_year}년 · 65세 이상 인구 비율(고령화율)")
+
+with st.expander("📚 용어 설명: 고령화사회 · 고령사회 · 초고령사회란?"):
+    st.markdown(
+        """
+65세 이상 인구 비율을 기준으로 사회를 아래 세 단계로 나눕니다.
+
+| 단계 | 65세 이상 비율 | 의미 |
+|---|---|---|
+| 고령화사회 | 7% 이상 | 고령 인구가 늘어나기 시작하는 단계 |
+| 고령사회 | 14% 이상 | 전체 인구 7명 중 1명이 고령자인 단계 |
+| 초고령사회 | 20% 이상 | 전체 인구 5명 중 1명이 고령자인 단계 |
+
+우리나라는 전국 평균으로 이미 초고령사회에 진입했으며, 아래 그래프의 점선이 이 세 기준선을 나타냅니다.
+
+**노년부양비**란 생산연령인구(15~64세) 100명이 부양해야 하는 고령인구(65세 이상) 수를 뜻합니다.
+숫자가 클수록 젊은 세대의 부양 부담이 크다는 의미입니다.
+        """
+    )
 
 # ------------------------------------------------------------
 # 지도 그리기 (단계구분도, 5단계 색, 배경 타일 없음)
@@ -308,6 +371,17 @@ bar_fig.add_vline(
     annotation_position="top",
 )
 
+# 고령화사회·고령사회·초고령사회 기준선(7%·14%·20%) 표시
+for stage_value, stage_name in AGING_STAGES:
+    bar_fig.add_vline(
+        x=stage_value,
+        line_dash="dot",
+        line_color="darkorange",
+        annotation_text=f"{stage_name} {stage_value}%",
+        annotation_position="bottom",
+        annotation_font_color="darkorange",
+    )
+
 bar_fig.update_layout(
     xaxis_title="고령화율(%)",
     yaxis_title="",
@@ -323,7 +397,7 @@ st.plotly_chart(bar_fig, use_container_width=True)
 st.subheader("연도별 고령화 변화 지도")
 st.caption("하단의 ▶ 버튼을 누르거나 슬라이더를 움직이면 연도별 변화를 볼 수 있어요.")
 
-all_years_df = build_all_years_ratio(pop_df)
+all_years_df = build_all_years_ratio(pop_df, geo_names)
 all_years_df = all_years_df.sort_values("연도")
 
 anim_fig = px.choropleth(
@@ -368,34 +442,79 @@ bottom10 = ratio_df.sort_values("고령화율", ascending=True).head(10)
 
 col1, col2 = st.columns(2)
 
+# 표 안의 글자를 모두 가운데 정렬하기 위한 스타일
+center_style = [
+    {"selector": "th", "props": [("text-align", "center")]},
+    {"selector": "td", "props": [("text-align", "center")]},
+]
+
 with col1:
     st.markdown("**🔺 고령화율이 높은 시군구 TOP 10**")
-    st.dataframe(
-        top10[["시도", "시군구", "고령화율"]].reset_index(drop=True),
-        use_container_width=True,
+    top10_styled = (
+        top10[["시도", "시군구", "고령화율"]]
+        .reset_index(drop=True)
+        .style.set_table_styles(center_style)
     )
+    st.dataframe(top10_styled, use_container_width=True)
 
 with col2:
     st.markdown("**🔻 고령화율이 낮은 시군구 TOP 10**")
-    st.dataframe(
-        bottom10[["시도", "시군구", "고령화율"]].reset_index(drop=True),
-        use_container_width=True,
+    bottom10_styled = (
+        bottom10[["시도", "시군구", "고령화율"]]
+        .reset_index(drop=True)
+        .style.set_table_styles(center_style)
     )
+    st.dataframe(bottom10_styled, use_container_width=True)
 
 # ------------------------------------------------------------
-# 지역별 인구 피라미드
+# 지역별 상세 정보 (노년부양비 계산기 + 인구 피라미드)
 # ------------------------------------------------------------
-st.subheader("지역별 인구 피라미드")
+st.subheader("지역별 상세 정보")
 
-# 선택창에 보여줄 '시도 시군구' 이름 목록 만들기
+# '도 선택' -> '시군구 선택' 2단계 선택창 (한 번에 다 찾는 것보다 가독성이 좋음)
 region_df = ratio_df.copy()
-region_df["지역표시"] = region_df["시도"] + " " + region_df["시군구"]
-region_df = region_df.sort_values("지역표시")
 
-selected_label = st.selectbox("지역을 선택하세요", region_df["지역표시"].tolist())
-selected_code = region_df.loc[
-    region_df["지역표시"] == selected_label, "시군구코드"
-].values[0]
+sido_list = sorted(region_df["시도"].unique())
+
+sel_col1, sel_col2 = st.columns(2)
+
+with sel_col1:
+    selected_sido = st.selectbox("① 시·도를 선택하세요", sido_list)
+
+sigungu_list = sorted(
+    region_df.loc[region_df["시도"] == selected_sido, "시군구"].unique()
+)
+
+with sel_col2:
+    selected_sigungu = st.selectbox("② 시·군·구를 선택하세요", sigungu_list)
+
+selected_row = region_df[
+    (region_df["시도"] == selected_sido) & (region_df["시군구"] == selected_sigungu)
+].iloc[0]
+selected_code = selected_row["시군구코드"]
+selected_label = f"{selected_sido} {selected_sigungu}"
+
+# --- 노년부양비 계산기 ---
+st.markdown(f"#### 🧮 {selected_label} 노년부양비 계산기")
+
+metric_col1, metric_col2, metric_col3 = st.columns(3)
+
+with metric_col1:
+    st.metric("고령화율 (65세 이상 비율)", f"{selected_row['고령화율']:.1f}%")
+
+with metric_col2:
+    st.metric("노년부양비", f"{selected_row['노년부양비']:.1f}%")
+
+with metric_col3:
+    st.metric("부양 구조", f"생산인구 {selected_row['부양인원']:.1f}명당 1명")
+
+st.caption(
+    "노년부양비 = 고령인구(65세 이상) ÷ 생산연령인구(15~64세) × 100. "
+    "생산연령인구 100명이 고령자를 몇 명 부양해야 하는지를 나타냅니다."
+)
+
+# --- 인구 피라미드 ---
+st.markdown("#### 👨‍👩‍👧‍👦 인구 피라미드")
 
 pyramid_df = build_pyramid(pop_df, latest_year, selected_code)
 
