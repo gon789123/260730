@@ -13,7 +13,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 
 # ------------------------------------------------------------
 # 기본 설정
@@ -392,29 +391,52 @@ bar_fig.update_layout(
 st.plotly_chart(bar_fig, use_container_width=True)
 
 # ------------------------------------------------------------
-# 연도별 고령화 변화 애니메이션 지도
+# 연도별 고령화 변화 지도 (슬라이더로 한 해씩 보기)
 # ------------------------------------------------------------
 st.subheader("연도별 고령화 변화 지도")
-st.caption("하단의 ▶ 버튼을 누르거나 슬라이더를 움직이면 연도별 변화를 볼 수 있어요.")
+st.caption("슬라이더를 움직여서 연도별 변화를 볼 수 있어요.")
 
 all_years_df = build_all_years_ratio(pop_df, geo_names)
-all_years_df = all_years_df.sort_values("연도")
 
-anim_fig = px.choropleth(
-    all_years_df,
-    geojson=geojson_data,
-    locations="시군구코드",
-    featureidkey="properties.코드",
-    color="구간라벨",
-    color_discrete_map=dict(zip(BIN_LABELS, BIN_COLORS)),
-    category_orders={"구간라벨": BIN_LABELS},
-    animation_frame="연도",
-    hover_name="시군구",
-    hover_data={"시도": True, "고령화율": True, "시군구코드": False, "구간라벨": False},
+year_list = sorted(all_years_df["연도"].unique())
+selected_year = st.select_slider(
+    "연도를 선택하세요", options=year_list, value=year_list[-1]
 )
 
-# 배경 지도 타일 없이 경계선만 보이도록 설정 (메인 지도와 동일)
-anim_fig.update_geos(
+# 선택한 연도의 데이터만 뽑아서 지도 1장만 그린다
+# (애니메이션으로 모든 연도를 한 번에 담으면 데이터 용량이 커져서
+#  Streamlit Cloud에서 느려지거나 멈추는 문제가 있었기 때문에,
+#  슬라이더로 한 해씩만 가볍게 그리는 방식으로 바꿈)
+year_df = all_years_df[all_years_df["연도"] == selected_year].copy()
+year_df["hover_text"] = (
+    year_df["시도"] + " " + year_df["시군구"]
+    + "<br>고령화율: " + year_df["고령화율"].astype(str) + "%"
+)
+year_z_values = year_df["구간"] + 0.5
+
+year_fig = go.Figure(
+    go.Choropleth(
+        geojson=geojson_data,
+        locations=year_df["시군구코드"],
+        z=year_z_values,
+        featureidkey="properties.코드",
+        text=year_df["hover_text"],
+        hoverinfo="text",
+        colorscale=colorscale,
+        zmin=0,
+        zmax=n_bins,
+        marker_line_color="white",
+        marker_line_width=0.5,
+        colorbar=dict(
+            title="고령화율",
+            tickmode="array",
+            tickvals=[i + 0.5 for i in range(n_bins)],
+            ticktext=BIN_LABELS,
+        ),
+    )
+)
+
+year_fig.update_geos(
     fitbounds="locations",
     visible=False,
     showcountries=False,
@@ -424,13 +446,12 @@ anim_fig.update_geos(
     bgcolor="rgba(0,0,0,0)",
 )
 
-anim_fig.update_layout(
+year_fig.update_layout(
     margin=dict(l=0, r=0, t=10, b=0),
     height=700,
-    legend_title_text="고령화율 구간",
 )
 
-st.plotly_chart(anim_fig, use_container_width=True)
+st.plotly_chart(year_fig, use_container_width=True)
 
 # ------------------------------------------------------------
 # 고령화율 상위 10곳 / 하위 10곳 표
@@ -440,31 +461,53 @@ st.subheader("고령화율 순위 표")
 top10 = ratio_df.sort_values("고령화율", ascending=False).head(10)
 bottom10 = ratio_df.sort_values("고령화율", ascending=True).head(10)
 
-col1, col2 = st.columns(2)
 
-# 표 안의 글자를 모두 가운데 정렬하기 위한 스타일
-center_style = [
-    {"selector": "th", "props": [("text-align", "center")]},
-    {"selector": "td", "props": [("text-align", "center")]},
-]
+def render_centered_table(table_df: pd.DataFrame):
+    """가운데 정렬이 확실히 적용되는 HTML 표를 그린다.
+
+    st.dataframe은 내부적으로 자체 그리드 컴포넌트를 쓰기 때문에
+    pandas Styler로 지정한 text-align 같은 CSS가 반영되지 않는 경우가 있다.
+    그래서 직접 HTML 표를 만들어 st.markdown으로 그리는 방식을 쓴다.
+    """
+    display_df = table_df.copy()
+    display_df.index = range(1, len(display_df) + 1)
+    display_df["고령화율"] = display_df["고령화율"].map(lambda v: f"{v:.2f}%")
+
+    html_table = display_df.to_html(classes="ranking-table", border=0)
+
+    styled_html = f"""
+    <style>
+    .ranking-table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+    }}
+    .ranking-table th, .ranking-table td {{
+        text-align: center !important;
+        padding: 6px 8px;
+    }}
+    .ranking-table thead th {{
+        background-color: #3182bd;
+        color: white;
+    }}
+    .ranking-table tbody tr:nth-child(even) {{
+        background-color: #f2f6fc;
+    }}
+    </style>
+    {html_table}
+    """
+    st.markdown(styled_html, unsafe_allow_html=True)
+
+
+col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("**🔺 고령화율이 높은 시군구 TOP 10**")
-    top10_styled = (
-        top10[["시도", "시군구", "고령화율"]]
-        .reset_index(drop=True)
-        .style.set_table_styles(center_style)
-    )
-    st.dataframe(top10_styled, use_container_width=True)
+    render_centered_table(top10[["시도", "시군구", "고령화율"]])
 
 with col2:
     st.markdown("**🔻 고령화율이 낮은 시군구 TOP 10**")
-    bottom10_styled = (
-        bottom10[["시도", "시군구", "고령화율"]]
-        .reset_index(drop=True)
-        .style.set_table_styles(center_style)
-    )
-    st.dataframe(bottom10_styled, use_container_width=True)
+    render_centered_table(bottom10[["시도", "시군구", "고령화율"]])
 
 # ------------------------------------------------------------
 # 지역별 상세 정보 (노년부양비 계산기 + 인구 피라미드)
